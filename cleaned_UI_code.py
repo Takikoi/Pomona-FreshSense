@@ -9,7 +9,7 @@ import socket
 import joblib
 import subprocess
 import requests
-import psutil
+import math
 from picamera2 import Picamera2
 from PIL import Image, ImageDraw, ImageFont
 from gpiozero import DigitalOutputDevice
@@ -44,6 +44,10 @@ BUTTON_THRESHOLDS = {
 
 # Global variables
 picam2 = Picamera2()
+nirs = NIRS()
+nirs.set_lamp_on_off(0)
+nirs.clear_error_status()
+nirs.set_hibernate(False)
 camera_active = False
 button_pressed = False
 button_queue = []
@@ -51,15 +55,19 @@ image_queue = Queue(maxsize=1)
 frame_state = "1"
 last_base_img = "UI/1.jpg"
 last_displayed_image = None
+last_detector_temp = None
+last_lamp_status = False
 API_URL = "https://carefully-real-narwhal.ngrok-free.app"
-wifi_connected_image = "wifi/wifi.jpg"
-wifi_disconnected_image = "wifi/nowifi.jpg"
-lamp_on_1_image = "lamp/lamp_on_1.jpg"
-lamp_on_0_image = "lamp/lamp_on_0.jpg"
-lamp_off_1_image = "lamp/lamp_off_1.jpg"
-lamp_off_0_image = "lamp/lamp_off_0.jpg"
-beef_model = "svm_model.pkl"
-pork_model = "xgb_model.pkl"
+wifi_connected_image = "UI/wifi/wifi.jpg"
+wifi_disconnected_image = "UI/wifi/nowifi.jpg"
+lamp_on_1_image = "UI/lamp/lamp_on_1.jpg"
+lamp_on_0_image = "UI/lamp/lamp_on_0.jpg"
+lamp_off_1_image = "UI/lamp/lamp_off_1.jpg"
+lamp_off_0_image = "UI/lamp/lamp_off_0.jpg"
+# beef_model = "svm_model.pkl"
+# pork_model = "xgb_model.pkl"
+beef_model = "output_model.pkl"
+pork_model = "output_model.pkl"
 
 # Basic SPI and Display Functions
 def read_adc_channel(channel):
@@ -149,8 +157,8 @@ def edit_image(base_image, overlays=None, texts=None):
 # NIR Scanner and Plotting
 def plot_wavelength_data(wavelength_data, intensity_data):
     """Plots wavelength vs intensity and returns as an image."""
-    fig, ax = plt.subplots(facecolor='#c3c4bf')
-    ax.set_facecolor('#b0b0ac')
+    fig, ax = plt.subplots(facecolor='#EAF4E3')
+    ax.set_facecolor('#DAE9D0')
     ax.plot(wavelength_data, intensity_data, color='blue')
     ax.set_ylabel('Intensity')
     ax.set_xlabel('Wavelength')
@@ -158,7 +166,6 @@ def plot_wavelength_data(wavelength_data, intensity_data):
     plt.savefig(buf, format='png')
     buf.seek(0)
     img = Image.open(buf).convert('RGB')
-    img = img.resize((240, 320))
     plt.close(fig)
     return img
 
@@ -180,8 +187,6 @@ def stop_camera_feed():
     """Stops the camera feed."""
     global camera_active
     camera_active = False
-    # if camera_thread and camera_thread.is_alive():
-    #     camera_thread.join()  # Wait for the camera thread to end
     picam2.stop()
 
 # Network and WiFi functions
@@ -193,24 +198,8 @@ def is_wifi_connected():
     except OSError:
         return False
 
-# def connect_to_wifi(ssid, password):
-#     """Connects to a WiFi network with given SSID and password."""
-#     command = f'nmcli dev wifi connect "{ssid}" password "{password}"'
-#     subprocess.run(command, shell=True, check=True)
-
-# def parse_wifi_info(qr_data):
-#     """Get SSID and password information from QR data."""
-#     if qr_data.startswith("WIFI:"):
-#         qr_data = qr_data[5:].strip()
-#         details = qr_data.split(";")
-#         ssid = details[0].split(":")[1]
-#         password = details[1].split(":")[1]
-#         return ssid, password
-#     else:
-#         # raise ValueError("QR code format not supported")
-#         return False
-
 def connect_wifi_from_qr(image):
+    """Connects to a Wifi network with SSID and password from QR data."""
     qrcodes = decode(image)
     if qrcodes:
         for qr in qrcodes:
@@ -224,18 +213,8 @@ def connect_wifi_from_qr(image):
                 subprocess.run(command, shell=True, check=True)
 
 # Firmware and Data Upload
-# def download_firmware():
-#     """Downloads the latest firmware from the server."""
-#     url = f'{API_URL}/api/v1/PklModel/latest'
-#     response = requests.get(url)
-#     if response.status_code == 200:
-#         file_path = os.path.join(os.getcwd(), 'output_model.pkl')
-#         with open(file_path, 'wb') as f:
-#             f.write(bytes(response.json()['data']['data']))
-#         return True
-#     else:
-#         return False
 def download_firmware():
+    """Download the lastest firmware from the server"""
     url = f'{API_URL}/api/v1/PklModel/latest'
     response = requests.get(url)
     if response.status_code == 200:
@@ -261,60 +240,59 @@ def upload_report(qr_img, proof_img):
     """Uploads QR and food images while reporting to the server."""
     url = f'{API_URL}/api/v1/report/upload'
     files = {
-        'file1': ('image1.jpg', qr_img, 'image/jpeg'),
-        'file2': ('image2.jpg', proof_img, 'image/jpeg')
+        'file1': ('image1.jpg', proof_img, 'image/jpeg'),
+        'file2': ('image2.jpg', qr_img, 'image/jpeg')
     }
     requests.post(url, files=files)
 
 # UI Updating
 def update_status_bar(base_image_path):
     """Updates the status bar with time and WiFi status."""
-    temp_cpu = psutil.sensors_temperatures()['cpu_thermal'][0].current
-    temp_cpu = f"{temp_cpu:.1f}°C"
-    nirs = NIRS()
-    temp_detector = nirs.get_detector_temperature()
-    temp_detector = f"{temp_detector:.1f}°C"
+    with open("/sys/class/thermal/thermal_zone0/temp", "r") as file:
+        temp_cpu = int(file.read()) / 1000.0
+    temp_cpu = f"{math.floor(temp_cpu/5)*5:.0f}°C"
     current_time = datetime.now().strftime("%H:%M")
     current_wifi = wifi_connected_image if is_wifi_connected() else wifi_disconnected_image
     overlays = [(current_wifi, (410, 15), (50, 50))]
-    texts = [(temp_cpu, (10, 10), 15, "#F4F7F5"),
-        (temp_detector, (10, 30), 15, "#F4F7F5"),
+    temp_detector = f"{last_detector_temp:.1f}°C" if last_detector_temp else " "
+    texts = [(temp_cpu, (37, 9), 25, "#F4F7F5"),
+        (temp_detector, (37, 46), 25, "#F4F7F5"),
         (current_time, (170, 20), 40, "#F4F7F5")]
     edited_image = edit_image(base_image_path, overlays=overlays, texts=texts)
     display_image(edited_image)
 
 def update_status_bar_wLamp(base_image, type=None):
     """Updates the status bar and lamp ON/OFF"""
-    nirs = NIRS()
     if type:
-        current_lamp = lamp_on_1_image if nirs.get_lamp_status() else lamp_off_1_image
+        current_lamp = lamp_on_1_image if last_lamp_status else lamp_off_1_image
     else:
-        current_lamp = lamp_on_0_image if nirs.get_lamp_status() else lamp_off_0_image
-    overlays = [(current_lamp, (400, 100), (100, 100))]
+        current_lamp = lamp_on_0_image if last_lamp_status else lamp_off_0_image
+    overlays = [(current_lamp, (410, 112), (38, 38))]
     edited_image = edit_image(base_image, overlays=overlays)
     update_status_bar(edited_image)
 
 def update_status_bar_wLamp_wResult(base_image, wavelength_data, intensity_data, type=None):
     """Updates the status bar and lamp ON/OFF and NIR Scan result"""
-    edited_image = edit_image(base_image, overlays=[(plot_wavelength_data(wavelength_data, intensity_data), (5, 205), (505, 430))])
+    edited_image = edit_image(base_image, overlays=[(plot_wavelength_data(wavelength_data, intensity_data), (5, 225), (505, 410))])
     update_status_bar_wLamp(edited_image, type) if type else update_status_bar_wLamp(edited_image)
 
 def update_status_bar_wCamFeed(base_image, camera_feed, wifi_name=None):
     """Updates the status bar and camera feed and wifi name if available"""
-    edited_image = edit_image(base_image, overlays=[(last_camera_feed, (15, 205), (450, 420))])
+    edited_image = edit_image(base_image, overlays=[(camera_feed, (5, 225), (470, 410))])
     if wifi_name:
         if is_wifi_connected():
             result = subprocess.run(["iwgetid", "-r"], capture_output=True, text=True, check=True)
             ssid = result.stdout.strip()
         else:
             ssid = "Wifi disconnected!"
-        edited_image = edit_image(edited_image, texts = [(ssid, (25, 105), 35, "#DAA520")])
+        edited_image = edit_image(edited_image, texts = [(ssid, (95, 155), 30, "#DAA520")])
     update_status_bar(edited_image)
 
 # Button Listener for UI Navigation
 def button_listener():
     """Listens for button presses and navigates the UI accordingly."""
     global frame_state, camera_active, image_queue, last_camera_feed, img_rp1, img_rp2
+    global last_detector_temp, last_lamp_status
     while True:
         button = read_button()
         if button:
@@ -324,13 +302,14 @@ def button_listener():
             case "1":
                 update_status_bar("UI/1.jpg")
                 if button_queue:
-                    if button_queue[0] == 'down':
-                        frame_state = "2"
-                    elif button_queue[0] == 'select':
-                        if os.path.exists("model_beef.pkl") and os.path.exists("model_pork.pkl"):
+                    if button_queue[0] == 'select':
+                        if os.path.exists(beef_model) and os.path.exists(pork_model):
                             frame_state = "1_1"
                         else:
                             frame_state = "1_3"
+                    
+                    elif button_queue[0] == 'down':
+                        frame_state = "2"
                     button_queue.pop(0)
 
             case "1_1":
@@ -362,14 +341,14 @@ def button_listener():
                     button_queue.pop(0)
 
             case "1_1_1":
-                nirs = NIRS()
                 update_status_bar_wLamp("UI/1_1_1.jpg")
                 if button_queue:
                     if button_queue[0] == 'select':
                         nirs.scan()
                         results = nirs.get_scan_results()
+                        last_detector_temp = results["temperature_detector"]
                         intensity = results["intensity"]
-                        # reference = results["reference"]
+                        intensity = [2 if x < 2 else x for x in intensity]
                         reference = [70933, 80262, 88283, 96274, 109441, 121705, 136827, 153952, 172041, 189436, 205751, 220790, 234985, 
                             248851, 262772, 276941, 295696, 309995, 324162, 337919, 350632, 362296, 372938, 382790, 390847, 397725, 
                             403039, 407212, 411373, 414042, 415732, 416463, 417887, 419439, 419376, 418787, 417571, 416250, 415476, 
@@ -406,9 +385,36 @@ def button_listener():
                         else:  # Not Fresh
                             frame_state = "1_1_1_21"
                     elif button_queue[0] == 'left':
+                        if last_lamp_status:
+                            nirs.set_lamp_on_off(0)
+                            last_lamp_status = False
                         frame_state = "1_1"
                     elif button_queue[0] == 'right':
                         frame_state = "1_1_2"
+                    button_queue.pop(0)
+            case "1_1_2":
+                update_status_bar_wLamp("UI/1_1_2.jpg", True)
+                if button_queue:
+                    if button_queue[0] == 'select':
+                        nirs.set_lamp_on_off(0) if last_lamp_status else nirs.set_lamp_on_off(1)
+                        last_lamp_status = not last_lamp_status
+                    elif button_queue[0] == 'left':
+                        frame_state = "1_1_1"
+                    elif button_queue[0] == 'down':
+                        frame_state = "1_1_3"
+                    button_queue.pop(0)
+            case "1_1_3":
+                update_status_bar_wLamp("UI/1_1_3.jpg")
+                if button_queue:
+                    if button_queue[0] == 'select':
+                        nirs.clear_error_status()
+                    elif button_queue[0] == 'up':
+                        frame_state = "1_1_2"
+                    elif button_queue[0] == 'left':
+                        if last_lamp_status:
+                            nirs.set_lamp_on_off(0)
+                            last_lamp_status = False
+                        frame_state = "1_1"
                     button_queue.pop(0)
 
             case "1_1_1_11":
@@ -426,7 +432,8 @@ def button_listener():
                 update_status_bar_wLamp_wResult("UI/1_1_1_12.jpg", results["wavelength"], results["intensity"], True)
                 if button_queue:
                     if button_queue[0] == 'select':
-                        nirs.set_lamp_on_off(0) if nirs.get_lamp_status() else nirs.set_lamp_on_off(1)
+                        nirs.set_lamp_on_off(0) if last_lamp_status else nirs.set_lamp_on_off(1)
+                        last_lamp_status = not last_lamp_status
                     elif button_queue[0] == 'down':
                         frame_state = "1_1_1_13"
                     elif button_queue[0] == 'left':
@@ -459,7 +466,8 @@ def button_listener():
                 update_status_bar_wLamp_wResult("UI/1_1_1_22.jpg", results["wavelength"], results["intensity"], True)
                 if button_queue:
                     if button_queue[0] == 'select':
-                        nirs.set_lamp_on_off(0) if nirs.get_lamp_status() else nirs.set_lamp_on_off(1)
+                        nirs.set_lamp_on_off(0) if last_lamp_status else nirs.set_lamp_on_off(1)
+                        last_lamp_status = not last_lamp_status
                     elif button_queue[0] == 'down':
                         frame_state = "1_1_1_23"
                     elif button_queue[0] == 'left':
@@ -481,8 +489,6 @@ def button_listener():
                     if button_queue[0] == 'select':
                         camera_active = True
                         threading.Thread(target=start_camera_feed).start()
-                        # camera_thread = threading.Thread(target=start_camera_feed)
-                        # camera_thread.start()
                         frame_state = "1_1_1_x_1"
                     elif button_queue[0] == 'up':
                         frame_state = "1_1_1_11"
@@ -494,10 +500,12 @@ def button_listener():
                 while image_queue.empty():
                     time.sleep(0.2)
                 last_camera_feed = image_queue.get()
-                update_status_bar_wCamFeed("1_1_1_x_1", last_camera_feed)
+                update_status_bar_wCamFeed("UI/1_1_1_x_1.jpg", last_camera_feed)
                 decoded_qr_codes = decode(last_camera_feed)
                 if decoded_qr_codes:
-                    img_rp1 = last_camera_feed
+                    jpeg_buffer = BytesIO()
+                    last_camera_feed.save(jpeg_buffer, format="JPEG")
+                    img_rp1 = jpeg_buffer.getvalue()
                     frame_state = "1_1_1_x_2"
                 if button_queue:
                     if button_queue[0] == 'left':
@@ -508,76 +516,51 @@ def button_listener():
                 while image_queue.empty():
                     time.sleep(0.2)
                 last_camera_feed = image_queue.get()
-                update_status_bar_wCamFeed("1_1_1_x_2", last_camera_feed)
+                update_status_bar_wCamFeed("UI/1_1_1_x_2.jpg", last_camera_feed)
                 if button_queue:
                     if button_queue[0] == 'select':
+                        jpeg_buffer = BytesIO()
+                        last_camera_feed.save(jpeg_buffer, format="JPEG")
+                        img_rp2 = jpeg_buffer.getvalue()
                         stop_camera_feed()
                         frame_state = "1_1_1_x_3"
                     elif button_queue[0] == 'left':
                         frame_state = "1_1_1_x_1"
                     button_queue.pop(0)
             case "1_1_1_x_3":
-                update_status_bar_wCamFeed("1_1_1_x_3", last_camera_feed)
+                update_status_bar_wCamFeed("UI/1_1_1_x_3.jpg", last_camera_feed)
                 if button_queue:
                     if button_queue[0] == 'select':
+                        upload_report(img_rp1, img_rp2)
                         frame_state = "1_1_1_x_5"
                     elif button_queue[0] == 'left':
                         camera_active = True
                         threading.Thread(target=start_camera_feed).start()
-                        # camera_thread = threading.Thread(target=start_camera_feed)
-                        # camera_thread.start()
                         frame_state = "1_1_1_x_2"
                     elif button_queue[0] == 'down':
                         frame_state = "1_1_1_x_4"
                     button_queue.pop(0)
             case "1_1_1_x_4":
-                update_status_bar_wCamFeed("1_1_1_x_4", last_camera_feed)
+                update_status_bar_wCamFeed("UI/1_1_1_x_4.jpg", last_camera_feed)
                 if button_queue:
                     if button_queue[0] in ['select', 'left']:
                         camera_active = True
                         threading.Thread(target=start_camera_feed).start()
-                        # camera_thread = threading.Thread(target=start_camera_feed)
-                        # camera_thread.start()
                         frame_state = "1_1_1_x_2"
                     elif button_queue[0] == 'up':
                         frame_state = "1_1_1_x_3"
                     button_queue.pop(0)
             case "1_1_1_x_5":
-                update_status_bar("1_1_1_x_5")
+                update_status_bar("UI/1_1_1_x_5.jpg")
                 if button_queue:
                     frame_state = "1_1_1_24"
-                    button_queue.pop(0)
-
-            case "1_1_2":
-                current_lamp = lamp_on_1_image if nirs.get_lamp_status() else lamp_off_1_image
-                UI_for_112 = edit_image("UI/1_1_2.jpg", overlays=[(current_lamp, (400, 100), (100, 100))])
-                update_status_bar(UI_for_112)
-                if button_queue:
-                    if button_queue[0] == 'select':
-                        nirs.set_lamp_on_off(0) if nirs.get_lamp_status() else nirs.set_lamp_on_off(1)
-                    elif button_queue[0] == 'left':
-                        frame_state = "1_1_1"
-                    elif button_queue[0] == 'down':
-                        frame_state = "1_1_3"
-                    button_queue.pop(0)
-            case "1_1_3":
-                current_lamp = lamp_on_0_image if nirs.get_lamp_status() else lamp_off_0_image
-                UI_for_113 = edit_image("UI/1_1_3.jpg", overlays=[(current_lamp, (400, 100), (100, 100))])
-                update_status_bar(UI_for_113)
-                if button_queue:
-                    if button_queue[0] == 'select':
-                        nirs.clear_error_status()
-                    elif button_queue[0] == 'up':
-                        frame_state = "1_1_2"
-                    elif button_queue[0] == 'left':
-                        frame_state = "1_1"
                     button_queue.pop(0)
 
             case "2":
                 update_status_bar("UI/2.jpg")
                 if button_queue:
                     if button_queue[0] == 'select':
-                        if is_wifi_connected:
+                        if is_wifi_connected():
                             frame_state = "2_1"
                         else:
                             frame_state = "2_4"
@@ -616,7 +599,7 @@ def button_listener():
                         frame_state = "2"
                     button_queue.pop(0)
             case "3_1":
-                if not is_wifi_connected:
+                if not is_wifi_connected():
                     frame_state = "3_2"
                 while image_queue.empty():
                     time.sleep(0.2)
@@ -632,6 +615,7 @@ def button_listener():
                 #             connect_to_wifi(ssid, password)
                 if button_queue:
                     if button_queue[0] == 'left':
+                        stop_camera_feed()
                         frame_state = "3"
                     button_queue.pop(0)
             case "3_2":
@@ -640,17 +624,11 @@ def button_listener():
                 while image_queue.empty():
                     time.sleep(0.2)
                 last_camera_feed = image_queue.get()
-                update_status_bar_wCamFeed("UI/3_2.jpg")
+                update_status_bar_wCamFeed("UI/3_2.jpg", last_camera_feed)
                 connect_wifi_from_qr(last_camera_feed)
-                # qrcodes = decode(last_camera_feed)
-                # if qrcodes:
-                #     for qr in qrcodes:
-                #         wifi_info = qr.data.decode("utf-8")
-                #         ssid, password = parse_wifi_info(wifi_info)
-                #         if ssid and password:
-                #             connect_to_wifi(ssid, password)
                 if button_queue:
                     if button_queue[0] == 'left':
+                        stop_camera_feed()
                         frame_state = "3"
                     button_queue.pop(0)
 
@@ -659,6 +637,7 @@ def initialize_system():
     """Initializes display and starts the button listener thread."""
     init_display()
     display_image("UI/0.jpg")
+    time.sleep(1)
     threading.Thread(target=button_listener, daemon=True).start()
 
 # Main program entry
